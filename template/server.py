@@ -24,6 +24,6 @@ if __name__ == "__main__":
         allowed_domains=allowed_domains,
         host=os.environ.get("HOST", "127.0.0.1"),
         port=int(os.environ.get("PORT", "8787")),
-        issuer=os.environ.get("CLOSEDMCP_ORIGIN", "https://closedmcp.canpai.io"),
+        issuer=os.environ.get("CLOSEDMCP_ORIGIN"),
         jwks_url=os.environ.get("CLOSEDMCP_JWKS_URL"),
     )

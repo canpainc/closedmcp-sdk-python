@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import threading
+import time
 from collections.abc import Iterable
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -12,16 +14,34 @@ from typing import Any
 from urllib.parse import urlsplit
 
 import jwt
-from jwt import PyJWKClient
+from jwt import PyJWKClient, PyJWKClientError
 from mcp.server.fastmcp import FastMCP as OfficialFastMCP
 from mcp.server.lowlevel import Server as OfficialServer
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from starlette.applications import Starlette
 from starlette.routing import Route
 
-CLOSEDMCP = "https://closedmcp.canpai.io"
+CLOSEDMCP = "https://closedmcp.com"
+LEGACY_CLOSEDMCP = "https://closedmcp.canpai.io"
 _person: ContextVar[Person | None] = ContextVar("closedmcp_person", default=None)
 _BEARER = re.compile(r"Bearer\s+(\S+)\Z", re.IGNORECASE)
+
+
+class _JWKClient(PyJWKClient):
+    def __init__(self, uri: str) -> None:
+        super().__init__(uri, timeout=5)
+        self._refresh_lock = threading.Lock()
+        self._last_refresh = float("-inf")
+
+    def get_signing_key(self, kid: str):
+        with self._refresh_lock:
+            signing_key = self.match_kid(self.get_signing_keys(), kid)
+            if signing_key is None and time.monotonic() - self._last_refresh >= 30:
+                self._last_refresh = time.monotonic()
+                signing_key = self.match_kid(self.get_signing_keys(refresh=True), kid)
+            if signing_key is None:
+                raise PyJWKClientError(f'Unable to find a signing key that matches: "{kid}"')
+            return signing_key
 
 
 @dataclass(frozen=True)
@@ -49,29 +69,33 @@ class Verifier:
         *,
         resource: str,
         allowed_domains: Iterable[str],
-        issuer: str = CLOSEDMCP,
+        issuer: str | None = None,
         jwks_url: str | None = None,
     ) -> None:
         url = urlsplit(resource)
         if url.scheme not in ("http", "https") or not url.netloc or url.query or url.fragment:
             raise ValueError("resource must be an absolute HTTP(S) MCP URL without query or fragment")
         self.resource = resource
-        self.issuer = issuer
+        self.issuer = issuer or CLOSEDMCP
         self.allowed_domains = {domain.strip().lower() for domain in allowed_domains if domain.strip()}
         if not self.allowed_domains:
             raise ValueError("allowed_domains must name at least one company")
-        self.keys = PyJWKClient(jwks_url or f"{issuer}/.well-known/jwks.json")
+        issuers = (self.issuer,) if issuer is not None else (CLOSEDMCP, LEGACY_CLOSEDMCP)
+        self.keys = {name: _JWKClient(jwks_url or f"{name}/.well-known/jwks.json") for name in issuers}
 
     def verify(self, authorization: str | None) -> Person:
         match = _BEARER.fullmatch(authorization or "")
         if match is None:
             raise jwt.InvalidTokenError("No sign-in token")
         token = match.group(1)
+        token_issuer = jwt.decode(token, options={"verify_signature": False}).get("iss")
+        if not isinstance(token_issuer, str) or token_issuer not in self.keys:
+            raise jwt.InvalidIssuerError("Invalid issuer")
         claims = jwt.decode(
             token,
-            self.keys.get_signing_key_from_jwt(token).key,
+            self.keys[token_issuer].get_signing_key_from_jwt(token).key,
             algorithms=["EdDSA"],
-            issuer=self.issuer,
+            issuer=token_issuer,
             audience=self.resource,
             options={
                 "require": ["iss", "aud", "sub", "email", "domain", "org", "iat", "exp", "jti"],
@@ -157,7 +181,7 @@ def closedmcp_app(
     *,
     resource: str,
     allowed_domains: Iterable[str],
-    issuer: str = CLOSEDMCP,
+    issuer: str | None = None,
     jwks_url: str | None = None,
 ) -> Any:
     """Return a protected ASGI app for an official MCP or standalone FastMCP server."""
@@ -185,7 +209,7 @@ def serve_with_closedmcp(
     *,
     resource: str,
     allowed_domains: Iterable[str],
-    issuer: str = CLOSEDMCP,
+    issuer: str | None = None,
     jwks_url: str | None = None,
     host: str = "127.0.0.1",
     port: int = 8787,
