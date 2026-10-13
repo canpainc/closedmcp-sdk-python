@@ -16,7 +16,7 @@ import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from jwt.algorithms import OKPAlgorithm
 
-from closedmcp import Verifier, closedmcp_app, current_user
+from closedmcp import CLOSEDMCP, Verifier, closedmcp_app, current_user
 
 EMAIL_ONE = "@".join(("user1", "example.com"))  # noqa: FLY002
 EMAIL_TWO = "@".join(("user2", "example.com"))  # noqa: FLY002
@@ -69,6 +69,47 @@ def test_verifier_happy_path_and_claims(keys):
         "id": "person-123", "email": EMAIL_ONE, "company": "example.com", "org": "acme", "aiApp": "Test app"}
     with pytest.raises(RuntimeError):
         current_user()
+
+
+def test_default_and_explicit_issuers(keys):
+    check = Verifier(resource=RESOURCE, allowed_domains=["example.com"], jwks_url=keys[1])
+    assert check.issuer == CLOSEDMCP
+    assert check.verify(f"Bearer {signed(keys, {'iss': CLOSEDMCP})}").id == "person-123"
+    legacy = "https://closedmcp.canpai.io"
+    assert check.verify(f"Bearer {signed(keys, {'iss': legacy})}").id == "person-123"
+    with pytest.raises(jwt.InvalidIssuerError):
+        check.verify(f"Bearer {signed(keys)}")
+    assert Verifier(resource=RESOURCE, allowed_domains=["example.com"]).keys[CLOSEDMCP].uri == f"{CLOSEDMCP}/.well-known/jwks.json"
+    assert Verifier(resource=RESOURCE, allowed_domains=["example.com"]).keys[legacy].uri == f"{legacy}/.well-known/jwks.json"
+    explicit = verifier(keys)
+    with pytest.raises(jwt.InvalidIssuerError):
+        explicit.verify(f"Bearer {signed(keys, {'iss': CLOSEDMCP})}")
+
+
+def test_unknown_kid_refresh_cooldown(keys, monkeypatch):
+    check = verifier(keys)
+    client = check.keys[ISSUER]
+    refreshes = []
+    original = client.get_signing_keys
+
+    def signing_keys(refresh=False):
+        if refresh:
+            refreshes.append(True)
+        return original(refresh=refresh)
+
+    monkeypatch.setattr(client, "get_signing_keys", signing_keys)
+    clock = [100.0]
+    monkeypatch.setattr("closedmcp.time.monotonic", lambda: clock[0])
+    token = jwt.encode({"iss": ISSUER}, keys[0], algorithm="EdDSA", headers={"kid": "unknown"})
+    for _ in range(2):
+        with pytest.raises(jwt.PyJWKClientError):
+            client.get_signing_key_from_jwt(token)
+    assert len(refreshes) == 1
+    clock[0] += 31
+    with pytest.raises(jwt.PyJWKClientError):
+        client.get_signing_key_from_jwt(token)
+    assert len(refreshes) == 2
+    assert client.timeout == 5
 
 
 def test_verifier_rejects_invalid_passes(keys):
