@@ -35,4 +35,30 @@ Replace the first import with `from fastmcp import FastMCP` to use standalone Fa
 
 For `/mcp`, metadata is at `/.well-known/oauth-protected-resource/mcp` and the generic metadata path. A missing or invalid pass receives `401` with `WWW-Authenticate: Bearer resource_metadata="<metadata URL>"`. Authenticated non-POST requests receive `405`. To use another ASGI server, call `closedmcp_app(app, resource=..., allowed_domains=...)` and serve the returned ASGI app. Its lifespan must be run by the ASGI server.
 
+## Hosted on ClosedMCP (Serverless MCPs)
+
+An app hosted on ClosedMCP does not use sign-in: ClosedMCP checks the caller and strips `Authorization` (so `serve_with_closedmcp` would reject every call). Use `closedmcp.hosted` instead. Serve `/mcp` on `0.0.0.0:8080` (`HOSTED_PATH`, `HOSTED_PORT`).
+
+```python
+from fastmcp import FastMCP
+from fastmcp.tools.tool import ToolResult
+from closedmcp.hosted import HOSTED_PORT, caller, events, open_channel
+
+mcp = FastMCP("chat")
+
+@mcp.tool
+def watch(room: str) -> ToolResult:
+    return ToolResult(content=f"Watching #{room}.", meta=open_channel(f"room:{room}", name=f"#{room}"))
+
+@mcp.tool
+def post(room: str, text: str) -> ToolResult:
+    return ToolResult(content="Sent.", meta=events([{"topic": f"room:{room}", "data": {"from": caller().email, "text": text}}]))
+
+mcp.run(transport="http", host="0.0.0.0", port=HOSTED_PORT, path="/mcp", stateless_http=True)
+```
+
+- `caller()` returns `Caller(id, email, org, client)` from the `X-ClosedMCP-*` headers of the current request and raises when they are missing. It works in FastMCP 2 and official `mcp` SDK tools; you may also pass a tool `Context`, a Starlette `Request`, or a headers mapping. `try_caller()` returns `None` instead of raising.
+- `open_channel(topic, name=None, ttl=None)` and `events([{"topic", "data"}])` build the `_meta` keys and raise `ValueError` on anything ClosedMCP would drop or change (topic at most 200 characters, name 80, `ttl` whole seconds from 30 to 7 days, at most 20 events, `data` at most 8 KB as JSON). Combine them with `{**open_channel(...), **events(...)}`. With the official SDK, return `CallToolResult(content=..., _meta=...)`.
+- `database_url()` returns `DATABASE_URL` (raises if no database is enabled); `live_database_url()` returns the read-only live URL in `closedmcp_run` sandboxes.
+
 See the [ClosedMCP documentation](https://closedmcp.com/docs).
