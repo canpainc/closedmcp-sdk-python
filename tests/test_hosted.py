@@ -181,3 +181,79 @@ def test_fastmcp2_tool_with_context_and_without():
     [answer] = asyncio.run(_calls(asgi, asgi.router.lifespan_context(asgi), ("whoami", {}, FAKE_HEADERS)))
     assert answer["content"][0]["text"] == EMAIL
     assert answer["_meta"] == {"closedmcp/events": [{"topic": "seen", "data": EXPECTED.__dict__}]}
+
+
+def _hello_servers():
+    from fastmcp import FastMCP
+    from mcp import types
+    from mcp.server.fastmcp import FastMCP as OfficialFastMCP
+    from mcp.server.lowlevel import Server
+
+    fast = FastMCP("hello")
+    fast.tool(lambda: "hi", name="hello")
+    official = OfficialFastMCP("hello")
+    official.tool(name="hello")(lambda: "hi")
+    low = Server("hello")
+
+    @low.list_tools()
+    async def tools():
+        return [types.Tool(name="hello", inputSchema={"type": "object"})]
+
+    return {"fastmcp": fast, "official": official, "lowlevel": low}
+
+
+@pytest.mark.parametrize("kind", ["fastmcp", "official", "lowlevel"])
+def test_http_app_serves_stateless_mcp_at_hosted_path(kind):
+    asgi = hosted.http_app(_hello_servers()[kind])
+
+    async def run():
+        async with asgi.router.lifespan_context(asgi), httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=asgi), base_url="http://127.0.0.1:8080") as client:
+            init = _result(await client.request(**_post("initialize", {
+                "protocolVersion": "2025-06-18", "capabilities": {},
+                "clientInfo": {"name": "test", "version": "1"}}, {})))
+            # Stateless: no session ID, so a second request needs no handshake state.
+            listed = _result(await client.request(**_post("tools/list", {}, {}, request_id=2)))
+            return init, listed
+
+    init, listed = asyncio.run(run())
+    assert init["protocolVersion"]
+    assert [t["name"] for t in listed["tools"]] == ["hello"]
+
+
+def test_http_app_rejects_other_objects():
+    with pytest.raises(TypeError, match="FastMCP"):
+        hosted.http_app(object())
+
+
+def test_serve_listens_where_closedmcp_calls(monkeypatch):
+    import uvicorn
+
+    seen = {}
+    monkeypatch.setattr(uvicorn, "run", lambda app, **kw: seen.update(kw, app=app))
+    hosted.serve(_hello_servers()["fastmcp"])
+    assert (seen["host"], seen["port"]) == ("0.0.0.0", 8080)
+    assert seen["app"] is not None
+
+
+def test_serve_answers_over_a_real_socket():
+    import socket
+    import threading
+    import time
+
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    threading.Thread(target=hosted.serve, args=(_hello_servers()["fastmcp"],),
+                     kwargs={"host": "127.0.0.1", "port": port}, daemon=True).start()
+    request = _post("tools/list", {}, {})
+    deadline = time.monotonic() + 15
+    while True:
+        try:
+            response = httpx.post(f"http://127.0.0.1:{port}/mcp", headers=request["headers"], json=request["json"])
+            break
+        except httpx.ConnectError:
+            if time.monotonic() > deadline:
+                raise
+            time.sleep(0.1)
+    assert [t["name"] for t in _result(response)["tools"]] == ["hello"]

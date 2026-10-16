@@ -2,7 +2,8 @@
 
 No network and no sign-in: ClosedMCP has already checked the caller and passes
 them in ``X-ClosedMCP-*`` headers. Works with FastMCP 2 and the official
-``mcp`` SDK (``mcp.server.fastmcp`` or the low-level server).
+``mcp`` SDK (``mcp.server.fastmcp`` or the low-level server). ``serve(server)``
+serves it the way ClosedMCP calls it.
 """
 
 from __future__ import annotations
@@ -155,6 +156,42 @@ def events(items: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     return {EVENTS_KEY: out}
 
 
+def http_app(server: Any) -> Any:
+    """The ASGI app that serves ``server`` the way ClosedMCP calls it: stateless Streamable HTTP at ``/mcp``.
+
+    ``server`` is a FastMCP 2 server, an official ``mcp`` FastMCP, or an official low-level ``Server``.
+    """
+    from mcp.server.fastmcp import FastMCP as OfficialFastMCP
+    from mcp.server.lowlevel import Server as OfficialServer
+
+    if isinstance(server, OfficialFastMCP):
+        server.settings.streamable_http_path = HOSTED_PATH
+        server.settings.stateless_http = True
+        return server.streamable_http_app()
+    if isinstance(server, OfficialServer):
+        from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
+        from starlette.applications import Starlette
+        from starlette.routing import Route
+
+        from closedmcp import _MCPHandler
+
+        manager = StreamableHTTPSessionManager(app=server, stateless=True)
+        return Starlette(routes=[Route(HOSTED_PATH, endpoint=_MCPHandler(manager))], lifespan=lambda _: manager.run())
+    if type(server).__module__.startswith("fastmcp.") and hasattr(server, "http_app"):
+        return server.http_app(path=HOSTED_PATH, stateless_http=True)
+    raise TypeError("serve: give a FastMCP server or an official MCP Server")
+
+
+def serve(server: Any, *, host: str = "0.0.0.0", port: int = HOSTED_PORT) -> None:
+    """Serve MCP Streamable HTTP at ``/mcp`` on ``0.0.0.0:8080``, stateless, as ClosedMCP expects. Blocks.
+
+    Use it instead of ``server.run()``, which talks stdio and never goes live on ClosedMCP.
+    """
+    import uvicorn
+
+    uvicorn.run(http_app(server), host=host, port=port)
+
+
 def database_url() -> str:
     """The app's PostgreSQL URL (live when published, dev in runs). Raises if no database is enabled."""
     url = os.environ.get("DATABASE_URL")
@@ -186,7 +223,9 @@ __all__ = [
     "caller",
     "database_url",
     "events",
+    "http_app",
     "live_database_url",
     "open_channel",
+    "serve",
     "try_caller",
 ]
