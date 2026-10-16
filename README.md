@@ -37,12 +37,12 @@ For `/mcp`, metadata is at `/.well-known/oauth-protected-resource/mcp` and the g
 
 ## Hosted on ClosedMCP (Serverless MCPs)
 
-An app hosted on ClosedMCP does not use sign-in: ClosedMCP checks the caller and strips `Authorization` (so `serve_with_closedmcp` would reject every call). Use `closedmcp.hosted` instead. Serve `/mcp` on `0.0.0.0:8080` (`HOSTED_PATH`, `HOSTED_PORT`).
+An app hosted on ClosedMCP does not use sign-in: ClosedMCP checks the caller and strips `Authorization` (so `serve_with_closedmcp` would reject every call). Use `closedmcp.hosted` instead. `serve(mcp)` (0.3.0+) serves `/mcp` on `0.0.0.0:8080`, stateless, the way ClosedMCP calls it; do not use `mcp.run()`, which talks stdio and never goes live.
 
 ```python
 from fastmcp import FastMCP
 from fastmcp.tools.tool import ToolResult
-from closedmcp.hosted import HOSTED_PORT, caller, events, open_channel
+from closedmcp.hosted import caller, events, open_channel, serve
 
 mcp = FastMCP("chat")
 
@@ -54,9 +54,11 @@ def watch(room: str) -> ToolResult:
 def post(room: str, text: str) -> ToolResult:
     return ToolResult(content="Sent.", meta=events([{"topic": f"room:{room}", "data": {"from": caller().email, "text": text}}]))
 
-mcp.run(transport="http", host="0.0.0.0", port=HOSTED_PORT, path="/mcp", stateless_http=True)
+if __name__ == "__main__":
+    serve(mcp)
 ```
 
+- `serve(server)` takes a FastMCP 2 server, an official `mcp` FastMCP or a low-level `Server` and blocks. `http_app(server)` returns the same ASGI app if you run it yourself.
 - `caller()` returns `Caller(id, email, org, client)` from the `X-ClosedMCP-*` headers of the current request and raises when they are missing. It works in FastMCP 2 and official `mcp` SDK tools; you may also pass a tool `Context`, a Starlette `Request`, or a headers mapping. `try_caller()` returns `None` instead of raising.
 - `open_channel(topic, name=None, ttl=None)` and `events([{"topic", "data"}])` build the `_meta` keys and raise `ValueError` on anything ClosedMCP would drop or change (topic at most 200 characters, name 80, `ttl` whole seconds from 30 to 7 days, at most 20 events, `data` at most 8 KB as JSON). Combine them with `{**open_channel(...), **events(...)}`. With the official SDK, return `CallToolResult(content=..., _meta=...)`.
 - `database_url()` returns `DATABASE_URL` (raises if no database is enabled); `live_database_url()` returns the read-only live URL in `closedmcp_run` sandboxes.
