@@ -8,22 +8,32 @@ import re
 import threading
 import time
 from collections.abc import Iterable
-from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlsplit
 
 import jwt
 from jwt import PyJWKClient, PyJWKClientError
+from mcp.server.auth.middleware.auth_context import (
+    AuthContextMiddleware,
+    get_access_token,
+)
+from mcp.server.auth.middleware.bearer_auth import (
+    BearerAuthBackend,
+    RequireAuthMiddleware,
+)
+from mcp.server.auth.provider import AccessToken
 from mcp.server.fastmcp import FastMCP as OfficialFastMCP
 from mcp.server.lowlevel import Server as OfficialServer
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
+from pydantic import AnyHttpUrl
 from starlette.applications import Starlette
+from starlette.middleware.authentication import AuthenticationMiddleware
 from starlette.routing import Route
 
 CLOSEDMCP = "https://closedmcp.com"
-LEGACY_CLOSEDMCP = "https://closedmcp.canpai.io"
-_person: ContextVar[Person | None] = ContextVar("closedmcp_person", default=None)
+REQUIRED_SCOPE = "mcp:tools"
+CLAIMS = "https://closedmcp.com/claims/"
 _BEARER = re.compile(r"Bearer\s+(\S+)\Z", re.IGNORECASE)
 
 
@@ -55,14 +65,18 @@ class Person:
 
 def current_user() -> Person:
     """The verified person for this MCP request."""
-    person = _person.get()
-    if person is None:
-        raise RuntimeError("No verified ClosedMCP person in this request")
-    return person
+    token = get_access_token()
+    if not isinstance(token, _AccessToken):
+        raise RuntimeError("No verified ClosedMCP person in this request")  # noqa: TRY004 - preserve the helper API
+    return token.person
+
+
+class _AccessToken(AccessToken):
+    person: Person
 
 
 class Verifier:
-    """Check a signed pass and its customer company against a required allowlist."""
+    """Check an OAuth access token and its customer company against a required allowlist."""
 
     def __init__(
         self,
@@ -80,27 +94,29 @@ class Verifier:
         self.allowed_domains = {domain.strip().lower() for domain in allowed_domains if domain.strip()}
         if not self.allowed_domains:
             raise ValueError("allowed_domains must name at least one company")
-        issuers = (self.issuer,) if issuer is not None else (CLOSEDMCP, LEGACY_CLOSEDMCP)
-        self.keys = {name: _JWKClient(jwks_url or f"{name}/.well-known/jwks.json") for name in issuers}
+        self.keys = _JWKClient(jwks_url or f"{self.issuer}/.well-known/jwks.json")
 
     def verify(self, authorization: str | None) -> Person:
         match = _BEARER.fullmatch(authorization or "")
         if match is None:
             raise jwt.InvalidTokenError("No sign-in token")
         token = match.group(1)
-        token_issuer = jwt.decode(token, options={"verify_signature": False}).get("iss")
-        if not isinstance(token_issuer, str) or token_issuer not in self.keys:
-            raise jwt.InvalidIssuerError("Invalid issuer")
+        return self._access_token(token, require_scope=True).person
+
+    async def verify_token(self, token: str) -> AccessToken | None:
+        """Official MCP TokenVerifier hook used by its bearer middleware."""
+        try:
+            return await asyncio.to_thread(self._access_token, token)
+        except (jwt.PyJWTError, ValueError, TypeError, KeyError, OSError):
+            return None
+
+    def _access_token(self, token: str, *, require_scope: bool = False) -> _AccessToken:
+        if jwt.get_unverified_header(token).get("typ") not in ("at+jwt", "application/at+jwt"):
+            raise jwt.InvalidTokenError("Not a JWT access token")
         claims = jwt.decode(
-            token,
-            self.keys[token_issuer].get_signing_key_from_jwt(token).key,
-            algorithms=["EdDSA"],
-            issuer=token_issuer,
-            audience=self.resource,
-            options={
-                "require": ["iss", "aud", "sub", "email", "domain", "org", "iat", "exp", "jti"],
-                "strict_aud": True,
-            },
+            token, self.keys.get_signing_key_from_jwt(token).key, algorithms=["EdDSA"],
+            issuer=self.issuer, audience=self.resource,
+            options={"require": ["iss", "aud", "sub", "email", f"{CLAIMS}domain", f"{CLAIMS}org", "iat", "exp", "jti", "client_id", "scope"], "strict_aud": True},
         )
         if claims["aud"] != self.resource:
             raise jwt.InvalidTokenError("Wrong MCP audience")
@@ -108,14 +124,22 @@ class Verifier:
         if (type(issued) not in (int, float) or type(expires) not in (int, float)
                 or expires <= issued or expires - issued > 300):
             raise jwt.InvalidTokenError("Sign-in token lifetime is invalid")
-        for name in ("sub", "email", "domain", "org", "jti"):
+        for name in ("sub", "email", f"{CLAIMS}domain", f"{CLAIMS}org", "jti", "client_id"):
             if not isinstance(claims[name], str) or not claims[name]:
                 raise jwt.InvalidTokenError("Sign-in token claims are invalid")
-        if "client" in claims and not isinstance(claims["client"], str):
+        if f"{CLAIMS}client" in claims and not isinstance(claims[f"{CLAIMS}client"], str):
             raise jwt.InvalidTokenError("Sign-in token claims are invalid")
-        if claims["domain"].lower() not in self.allowed_domains:
+        if claims[f"{CLAIMS}domain"].lower() not in self.allowed_domains:
             raise jwt.InvalidTokenError("Company is not allowed")
-        return Person(claims["sub"], claims["email"], claims["domain"], claims["org"], claims.get("client"))
+        if not isinstance(claims["scope"], str):
+            raise jwt.InvalidTokenError("Invalid scope claim")
+        scopes = claims["scope"].split()
+        if require_scope and REQUIRED_SCOPE not in scopes:
+            raise jwt.InvalidTokenError("Insufficient scope")
+        person = Person(claims["sub"], claims["email"], claims[f"{CLAIMS}domain"], claims[f"{CLAIMS}org"], claims.get(f"{CLAIMS}client"))
+        return _AccessToken(token=token, client_id=claims["client_id"], scopes=scopes,
+                            expires_at=claims["exp"], resource=self.resource, subject=claims["sub"],
+                            claims=claims, person=person)
 
 
 class _ProtectedApp:
@@ -126,10 +150,15 @@ class _ProtectedApp:
         self.path = url.path or "/"
         self.metadata_path = "/.well-known/oauth-protected-resource" + ("" if self.path == "/" else self.path)
         self.metadata_url = f"{url.scheme}://{url.netloc}{self.metadata_path}"
+        self.protected = AuthenticationMiddleware(
+            AuthContextMiddleware(RequireAuthMiddleware(self._serve, [REQUIRED_SCOPE], AnyHttpUrl(self.metadata_url))),
+            backend=BearerAuthBackend(verifier),
+        )
         self.metadata = {
             "resource": verifier.resource,
             "authorization_servers": [verifier.issuer],
             "bearer_methods_supported": ["header"],
+            "scopes_supported": [REQUIRED_SCOPE],
         }
 
     async def __call__(self, scope: dict, receive: Any, send: Any) -> None:
@@ -146,20 +175,13 @@ class _ProtectedApp:
         if path != self.path:
             await self._reply(send, 404, {"error": "not found"})
             return
-        authorization = next((value.decode("latin-1") for key, value in scope["headers"] if key.lower() == b"authorization"), None)
-        try:
-            person = await asyncio.to_thread(self.verifier.verify, authorization)
-        except (jwt.PyJWTError, ValueError, TypeError, KeyError, OSError):
-            await self._reply(send, 401, {"error": "unauthorized"}, [(b"www-authenticate", f'Bearer resource_metadata="{self.metadata_url}"'.encode())])
-            return
+        await self.protected(scope, receive, send)
+
+    async def _serve(self, scope: dict, receive: Any, send: Any) -> None:
         if scope["method"] != "POST":
             await self._reply(send, 405, {"error": "method not allowed"})
             return
-        token = _person.set(person)
-        try:
-            await self.app(scope, receive, send)
-        finally:
-            _person.reset(token)
+        await self.app(scope, receive, send)
 
     @staticmethod
     async def _reply(send: Any, status: int, body: dict, headers: list[tuple[bytes, bytes]] | None = None) -> None:

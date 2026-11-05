@@ -55,9 +55,11 @@ def signed(keys, changes=None, private=None):
     now = int(time.time())
     claims = {"iss": ISSUER, "aud": RESOURCE, "sub": "person-123", "email": EMAIL_ONE,
                   "domain": "example.com", "org": "acme", "client": "Test app", "iat": now,
-                  "exp": now + 300, "jti": "pass-123"}
+                  "exp": now + 300, "jti": "pass-123", "client_id": "test-client", "scope": "mcp:tools"}
     claims.update(changes or {})
-    return jwt.encode(claims, private or keys[0], algorithm="EdDSA", headers={"kid": "test-key"})
+    for name in ("domain", "org", "client"):
+        claims[f"https://closedmcp.com/claims/{name}"] = claims.pop(name)
+    return jwt.encode(claims, private or keys[0], algorithm="EdDSA", headers={"kid": "test-key", "typ": claims.pop("typ", "at+jwt")})
 
 
 def verifier(keys, **changes):
@@ -76,11 +78,11 @@ def test_default_and_explicit_issuers(keys):
     assert check.issuer == CLOSEDMCP
     assert check.verify(f"Bearer {signed(keys, {'iss': CLOSEDMCP})}").id == "person-123"
     legacy = "https://closedmcp.canpai.io"
-    assert check.verify(f"Bearer {signed(keys, {'iss': legacy})}").id == "person-123"
+    with pytest.raises(jwt.InvalidIssuerError):
+        check.verify(f"Bearer {signed(keys, {'iss': legacy})}")
     with pytest.raises(jwt.InvalidIssuerError):
         check.verify(f"Bearer {signed(keys)}")
-    assert Verifier(resource=RESOURCE, allowed_domains=["example.com"]).keys[CLOSEDMCP].uri == f"{CLOSEDMCP}/.well-known/jwks.json"
-    assert Verifier(resource=RESOURCE, allowed_domains=["example.com"]).keys[legacy].uri == f"{legacy}/.well-known/jwks.json"
+    assert Verifier(resource=RESOURCE, allowed_domains=["example.com"]).keys.uri == f"{CLOSEDMCP}/.well-known/jwks.json"
     explicit = verifier(keys)
     with pytest.raises(jwt.InvalidIssuerError):
         explicit.verify(f"Bearer {signed(keys, {'iss': CLOSEDMCP})}")
@@ -88,7 +90,7 @@ def test_default_and_explicit_issuers(keys):
 
 def test_unknown_kid_refresh_cooldown(keys, monkeypatch):
     check = verifier(keys)
-    client = check.keys[ISSUER]
+    client = check.keys
     refreshes = []
     original = client.get_signing_keys
 
@@ -125,6 +127,9 @@ def test_verifier_rejects_invalid_passes(keys):
         signed(keys, private=other_key),
         signed(keys, {"jti": ""}),
         signed(keys, {"client": 42}),
+        signed(keys, {"typ": "JWT"}),
+        signed(keys, {"client_id": ""}),
+        signed(keys, {"scope": "other"}),
     ]
     check = verifier(keys)
     for token in bad:
@@ -184,10 +189,13 @@ def test_http_metadata_auth_and_concurrent_people(keys, library):
     async def exercise():
         async with served_asgi(wrapped) as client:
             metadata = await client.get("/.well-known/oauth-protected-resource/mcp")
-            assert metadata.json() == {"resource": RESOURCE, "authorization_servers": [ISSUER], "bearer_methods_supported": ["header"]}
+            assert metadata.json() == {"resource": RESOURCE, "authorization_servers": [ISSUER], "bearer_methods_supported": ["header"], "scopes_supported": ["mcp:tools"]}
             missing = await client.post("/mcp")
             assert missing.status_code == 401
-            assert missing.headers["www-authenticate"] == 'Bearer resource_metadata="http://127.0.0.1:8798/.well-known/oauth-protected-resource/mcp"'
+            assert 'resource_metadata="http://127.0.0.1:8798/.well-known/oauth-protected-resource/mcp"' in missing.headers["www-authenticate"]
+            denied_scope = await client.request(**post("tools/list", {}, signed(keys, {"scope": "other"})))
+            assert denied_scope.status_code == 403
+            assert "insufficient_scope" in denied_scope.headers["www-authenticate"]
             token = signed(keys)
             init = result(await client.request(**post("initialize", {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "test", "version": "1"}}, token)))
             assert init["result"]["serverInfo"]["name"] == "hello"
