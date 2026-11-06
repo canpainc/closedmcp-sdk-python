@@ -2,6 +2,14 @@
 
 A small Python wrapper for Log in with ClosedMCP. It protects Streamable HTTP requests made to the official SDK’s `Server` or built-in `FastMCP`, or standalone FastMCP 2, verifies a signed pass on every call, and serves MCP protected-resource metadata.
 
+The public wrapper in 0.4.0 accepts OAuth resource access tokens with type `at+jwt`, a
+`client_id`, the `mcp:tools` scope and an audience matching the configured MCP URL.
+Company claims use the `https://closedmcp.com/claims/` namespace; the person helper
+keeps its existing fields. Old pass tokens and the implicit legacy issuer are
+rejected. The token follows RFC9068's claims and type using EdDSA; its mandatory
+RS256 support is not implemented. This is MCP OAuth, not ID-JAG/enterprise-managed
+authorization. Hosted caller helpers use their separate private contract.
+
 ## Add to an existing server
 
 Keep your existing official `mcp.server.fastmcp.FastMCP` or standalone `fastmcp.FastMCP` 2 instance. Replace its HTTP serving call with:
@@ -31,7 +39,7 @@ serve_with_closedmcp(
 
 Replace the first import with `from fastmcp import FastMCP` to use standalone FastMCP 2. Install with `pip install closedmcp` for the official SDK or `pip install 'closedmcp[fastmcp]'` for both. This repository also has a [runnable template](template/server.py): install the package locally with `pip install -e .`, then run `MCP_URL=https://example.com/mcp ALLOWED_DOMAINS=example.com python template/server.py`. Set `PORT` and `HOST` for the listening socket. `CLOSEDMCP_ORIGIN` and `CLOSEDMCP_JWKS_URL` are available for local integration tests.
 
-`resource` is the exact public MCP URL and JWT audience. `allowed_domains` must contain at least one verified company domain. By default, the wrapper accepts passes from `https://closedmcp.com` and the legacy `https://closedmcp.canpai.io`, using each issuer's JWKS. An explicit `issuer` accepts only that issuer. The wrapper checks the EdDSA signature, issuer, exact audience, expiry, five-minute maximum lifetime, required identity claims, and company domain. Unknown key IDs trigger at most one JWKS refresh per 30 seconds. `current_user()` returns a `Person` with `id`, `email`, `company`, `org`, and optional `aiApp`; it raises outside a verified request. `aiApp` is a client supplied display value.
+`resource` is the exact public MCP URL and JWT audience. `allowed_domains` must contain at least one verified company domain. By default, the wrapper accepts only `https://closedmcp.com`. An explicit `issuer` accepts only that issuer. The wrapper checks the EdDSA signature, issuer, exact audience, expiry, five-minute maximum lifetime, required identity claims, and company domain. Unknown key IDs trigger at most one JWKS refresh per 30 seconds. `current_user()` returns a `Person` with `id`, `email`, `company`, `org`, and optional `aiApp`; it raises outside a verified request. `aiApp` is a client supplied display value.
 
 For `/mcp`, metadata is at `/.well-known/oauth-protected-resource/mcp` and the generic metadata path. A missing or invalid pass receives `401` with `WWW-Authenticate: Bearer resource_metadata="<metadata URL>"`. Authenticated non-POST requests receive `405`. To use another ASGI server, call `closedmcp_app(app, resource=..., allowed_domains=...)` and serve the returned ASGI app. Its lifespan must be run by the ASGI server.
 
